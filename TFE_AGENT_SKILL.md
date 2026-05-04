@@ -1,28 +1,25 @@
 ---
 name: terraform-azure
-description: Use this skill for writing, reviewing, debugging, and optimizing Terraform scripts targeting Azure infrastructure. Trigger whenever the user mentions Terraform, HCL, azurerm provider, Azure resource deployment, infrastructure as code, tf files, terraform plan/apply errors, HCP Terraform, Terraform Enterprise, or asks to create/modify Azure resources like Container Apps, App Gateway, APIM, Key Vault, VNets, NSGs, Private DNS, Service Bus, PostgreSQL, or any azurerm_* resource. Also trigger for Terraform state issues, module development, variable management, backend configuration, CI/CD pipeline integration with Terraform, and converting Azure portal configurations to Terraform code.
+description: Write/review/debug Terraform for Azure. Trigger on: Terraform, HCL, azurerm, Azure deployment, IaC, tf files, plan/apply errors, HCP Terraform, TFE, state issues, modules, variables, backend config, CI/CD pipelines, portal-to-TF conversion.
 ---
 
-# Terraform Azure Infrastructure Skill
+# Terraform Azure Skill
 
-## Purpose
-Write, review, debug, and optimize Terraform configurations for Azure infrastructure following enterprise best practices. This skill captures real-world solutions to common Azure networking, security, and deployment challenges.
+Write, review, debug Terraform for Azure. Enterprise patterns. Real-world fixes.
 
 ---
 
-## App Gateway to Container Apps Connectivity
+## App Gateway → Container Apps 502
 
-### Problem
-App Gateway returns 502 Bad Gateway when trying to reach Container Apps.
-
-### Root Causes and Fixes
+### Root Causes
 
 **1. DNS Resolution Failure**
-When a VNet has custom DNS servers, they won't resolve Azure Private DNS zones unless configured to forward to `168.63.129.16`. App Gateway can't resolve the Container App FQDN.
+
+Custom DNS servers won't resolve Azure Private DNS unless forwarding to `168.63.129.16`.
 
 Fix options:
-- Add conditional forwarder on custom DNS servers for `*.azurecontainerapps.io` → `168.63.129.16`
-- Deploy a DNS Private Resolver (required when environment has no internet access)
+- Conditional forwarder on custom DNS: `*.azurecontainerapps.io` → `168.63.129.16`
+- Deploy DNS Private Resolver (required for no-internet envs)
 
 ```hcl
 resource "azurerm_subnet" "dns_resolver_inbound" {
@@ -59,18 +56,19 @@ resource "azurerm_private_dns_resolver_inbound_endpoint" "inbound" {
 }
 ```
 
-Important notes:
-- The resolver needs a dedicated `/28` subnet with delegation
-- After adding resolver IP to VNet DNS, the App Gateway must be reconfigured to pick up new DNS
-- If VNet has multiple DNS servers, put the resolver IP first — DNS queries try servers in order, timeouts on earlier servers cause probe failures
-- The private DNS zone must be linked to the VNet where the App Gateway lives, not just the Container Apps VNet
+Notes:
+- Resolver needs dedicated `/28` subnet with delegation
+- After adding resolver IP to VNet DNS, reconfigure App Gateway to pick up new DNS
+- Multiple DNS servers? Put resolver IP first — queries try in order, timeouts cause probe failures
+- Private DNS zone must link to App Gateway VNet, not just Container Apps VNet
 
 **2. Route Table Intercepting Traffic**
-If a route table has a broad route like `10.0.0.0/8 → Virtual Appliance (firewall)`, it intercepts traffic to Container Apps internal IPs.
 
-Container Apps environments get internal IPs from Azure-managed ranges (e.g., `10.34.x.x`) that may differ from your VNet address space. These IPs still fall under broad `/8` routes.
+Broad route like `10.0.0.0/8 → Virtual Appliance` intercepts Container Apps internal IPs.
 
-Fix: Add a more specific route for the Container Apps environment IP:
+Container Apps get Azure-managed IPs (e.g., `10.34.x.x`) that fall under `/8` routes.
+
+Fix: More specific route for Container Apps:
 
 ```hcl
 resource "azurerm_route" "container_apps_direct" {
@@ -82,36 +80,38 @@ resource "azurerm_route" "container_apps_direct" {
 }
 ```
 
-`VnetLocal` works for both same-VNet and peered-VNet traffic.
+`VnetLocal` works for same-VNet and peered-VNet traffic.
 
 **3. NSG Missing Required Ports**
-App Gateway v2 requires inbound ports 65200-65535 from GatewayManager:
+
+App Gateway v2 requires inbound 65200-65535 from GatewayManager:
 
 ```hcl
 resource "azurerm_network_security_rule" "appgw_management" {
-  name                       = "AllowGatewayManager"
-  priority                   = 100
-  direction                  = "Inbound"
-  access                     = "Allow"
-  protocol                   = "Tcp"
-  source_port_range          = "*"
-  destination_port_range     = "65200-65535"
-  source_address_prefix      = "GatewayManager"
-  destination_address_prefix = "*"
-  resource_group_name        = var.resource_group_name
+  name                        = "AllowGatewayManager"
+  priority                    = 100
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "65200-65535"
+  source_address_prefix       = "GatewayManager"
+  destination_address_prefix  = "*"
+  resource_group_name         = var.resource_group_name
   network_security_group_name = var.appgw_nsg_name
 }
 ```
 
-**4. Backend Health Shows "Unknown"**
-This means Azure can't even check backend health. Causes:
-- NSG blocking management ports (65200-65535)
-- Route table forcing management traffic through a firewall
-- FQDN in backend pool can't be resolved
+**4. Backend Health "Unknown"**
 
-Check backend health in portal: Application Gateway → Backend health.
+Azure can't check health. Causes:
+- NSG blocking 65200-65535
+- Route table forcing management traffic through firewall
+- FQDN unresolvable
 
-### App Gateway Configuration
+Check: Portal → Application Gateway → Backend health
+
+### App Gateway Config
 
 ```hcl
 resource "azurerm_application_gateway" "appgw" {
@@ -157,18 +157,18 @@ resource "azurerm_application_gateway" "appgw" {
 ```
 
 Key points:
-- Use FQDN in backend pool, not IP addresses
-- `pick_host_name_from_backend_address = true` is critical — Container Apps rejects requests with wrong Host header
-- Minimum recommended subnet size is `/24`
-- Each App Gateway needs its own public IP
-- Use multi-site listeners or path-based routing for multiple services
+- Use FQDN in backend pool, not IPs
+- `pick_host_name_from_backend_address = true` critical — Container Apps reject wrong Host header
+- Min subnet size `/24`
+- Each App Gateway needs own public IP
 
 ---
 
-## Key Vault Access and Certificates
+## Key Vault Access
 
-### 403 Forbidden When Uploading Certificates
-When Key Vault has `public_network_access_enabled = false` and Terraform runs from outside the VNet:
+### 403 When Uploading Certs
+
+Key Vault has `public_network_access_enabled = false`, Terraform runs outside VNet:
 
 ```hcl
 resource "azurerm_key_vault" "vault" {
@@ -182,8 +182,9 @@ resource "azurerm_key_vault" "vault" {
 }
 ```
 
-### CA Certificates Without Private Keys
-Key Vault certificates require a private key. CA certs used as trust anchors don't have private keys. Upload as secrets:
+### CA Certs Without Private Keys
+
+Key Vault certs require private key. CA certs are trust anchors, no private key. Upload as secrets:
 
 ```hcl
 resource "azurerm_key_vault_secret" "ca_cert" {
@@ -194,14 +195,16 @@ resource "azurerm_key_vault_secret" "ca_cert" {
 }
 ```
 
-Application code using `getCertificateClient().getCertificate()` won't find secrets — code must use `SecretClient` for CA certs.
+App code using `getCertificateClient().getCertificate()` won't find secrets — use `SecretClient` for CA certs.
 
-### Extracting CA Cert from PFX
+### Extract CA from PFX
+
 ```bash
 openssl pkcs12 -in cert.pfx -legacy -nokeys -cacerts -passin pass:password -out ca-cert.pem
 ```
 
-### Stripping PEM Headers
+### Strip PEM Headers
+
 ```hcl
 locals {
   raw_pem    = file("${path.module}/certs/cert.pem")
@@ -214,11 +217,11 @@ locals {
 
 ---
 
-## mTLS Certificate Chain Validation
+## mTLS Chain Validation
 
 ### "Path does not chain with any of the trust anchors"
 
-The trust anchor must be the **CA certificate that signed** the client cert, not another end-entity cert signed by the same CA.
+Trust anchor must be **CA cert that signed** client cert, not another end-entity cert.
 
 ```
 CA Certificate (MUST be trust anchor)
@@ -226,11 +229,12 @@ CA Certificate (MUST be trust anchor)
     └── Service B cert (end-entity — cannot be trust anchor)
 ```
 
-Even if two certs share the same issuer, one cannot validate the other. Only the CA can.
+Two certs sharing same issuer cannot validate each other. Only CA can.
 
 ### Verify Cert Relationships
+
 ```bash
-# Check if cert is a CA
+# Check if cert is CA
 keytool -list -v -keystore cert.pfx -storetype PKCS12 -storepass password
 # Look for: BasicConstraints: [CA:true]
 
@@ -239,10 +243,12 @@ openssl x509 -in cert.pem -noout -issuer -subject
 # Trust anchor subject must match client cert issuer
 ```
 
-### Key Vault getCer() Returns Leaf Cert Only
-PFX with a cert chain — `getCer()` returns only the leaf, not CA certs. Upload CA cert separately where it is the primary cert.
+### Key Vault getCer() Returns Leaf Only
 
-### Container Apps Client Certificate Mode
+PFX with chain — `getCer()` returns only leaf, not CA certs. Upload CA cert separately as primary cert.
+
+### Container Apps Client Cert Mode
+
 ```hcl
 ingress {
   target_port             = 8080
@@ -257,9 +263,10 @@ ingress {
 
 ---
 
-## Container Apps Configuration
+## Container Apps Config
 
 ### Prevent Cold Starts
+
 ```hcl
 template {
   min_replicas = 1
@@ -268,6 +275,7 @@ template {
 ```
 
 ### User-Assigned Managed Identity
+
 ```hcl
 identity {
   type         = "UserAssigned"
@@ -286,7 +294,8 @@ template {
 
 Without `AZURE_CLIENT_ID`, `DefaultAzureCredential` throws `CredentialUnavailableException`.
 
-### Environment Variables from Maps
+### Env Vars from Maps
+
 ```hcl
 locals {
   app_env = {
@@ -316,15 +325,17 @@ dynamic "env" {
 ```
 
 ### Docker Base Image
-- Alpine (`eclipse-temurin:21-jre-alpine`) — smaller but may need `gcompat`/`libc6-compat`, permission issues common
-- Debian (`eclipse-temurin:21-jre-jammy`) — larger but works out of the box
-- `UnsatisfiedLinkError` for native libraries (Netty) → switch from Alpine to Debian
+
+- Alpine (`eclipse-temurin:21-jre-alpine`) — smaller, may need `gcompat`/`libc6-compat`, permission issues common
+- Debian (`eclipse-temurin:21-jre-jammy`) — larger, works out of box
+- `UnsatisfiedLinkError` for native libs (Netty) → switch Alpine to Debian
 
 ---
 
-## APIM Configuration
+## APIM Config
 
 ### Custom Domain
+
 ```hcl
 resource "azurerm_api_management_custom_domain" "domain" {
   api_management_id = azurerm_api_management.apim.id
@@ -336,9 +347,10 @@ resource "azurerm_api_management_custom_domain" "domain" {
 }
 ```
 
-`key_vault_id` is deprecated — use `key_vault_certificate_id` with `versionless_secret_id`.
+`key_vault_id` deprecated — use `key_vault_certificate_id` with `versionless_secret_id`.
 
 ### Unique API Paths
+
 Each API needs unique `path`. "One or more fields contain incorrect values" usually means path collision:
 
 ```hcl
@@ -351,11 +363,13 @@ resource "azurerm_api_management_api" "service_b" {
 ```
 
 ### Path Rewriting
+
 ```xml
 <rewrite-uri template="/api/service/{path}" copy-unmatched-params="true" />
 ```
 
 ### Wildcard Operations
+
 ```hcl
 resource "azurerm_api_management_api_operation" "wildcard" {
   for_each     = toset(["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
@@ -373,12 +387,13 @@ resource "azurerm_api_management_api_operation" "wildcard" {
 
 ---
 
-## Private DNS and VNet Peering
+## Private DNS & VNet Peering
 
 ### Cross-VNet DNS Resolution
-When App Gateway and Container Apps are in different peered VNets:
-1. Private DNS zone must be linked to **both** VNets
-2. Custom DNS servers must forward Azure private zone queries
+
+App Gateway and Container Apps in different peered VNets:
+1. Private DNS zone must link to **both** VNets
+2. Custom DNS must forward Azure private zone queries
 3. Route tables must allow cross-VNet traffic
 
 ```hcl
@@ -392,6 +407,7 @@ resource "azurerm_private_dns_zone_virtual_network_link" "link" {
 ```
 
 ### Adding VNet Address Space
+
 ```hcl
 address_space = [
   "10.7.223.32/28",  # existing
@@ -403,7 +419,8 @@ address_space = [
 
 ## CI/CD with HCP Terraform
 
-### GitHub Actions — Update Variable and Trigger Run
+### GitHub Actions — Update Variable & Trigger Run
+
 ```yaml
 - name: Deploy
   env:
@@ -434,30 +451,34 @@ address_space = [
 
 ---
 
-## Debugging Checklist
+## Debug Checklist
 
 ### App Gateway 502
+
 1. Portal → App Gateway → Backend health → read exact error
 2. "Unknown" → NSG blocking 65200-65535 or FQDN resolution failure
 3. "Unhealthy" → probe failing (wrong path, timeout, status code)
 4. Check route table for NVA routes intercepting backend traffic
 5. Check private DNS zone links
-6. Check custom DNS servers resolve private DNS zones
+6. Check custom DNS resolves private DNS zones
 
 ### Container App Not Starting
-1. Check logs: portal → Container App → Log stream
-2. `UnsatisfiedLinkError` → switch Alpine to Debian base image
+
+1. Logs: Portal → Container App → Log stream
+2. `UnsatisfiedLinkError` → switch Alpine to Debian
 3. `CredentialUnavailableException` → add `AZURE_CLIENT_ID` env var
 4. Key Vault 403 → verify managed identity access policy
 
 ### mTLS Failures
+
 1. Enable debug: `LOGGING_LEVEL_COM_<PACKAGE>=TRACE`
-2. Check certs loaded from Key Vault (cert name and size in logs)
+2. Check certs loaded from Key Vault (cert name/size in logs)
 3. Verify trust anchor is CA cert (`CA:true`) not end-entity
 4. Verify client cert issuer matches trust anchor subject
 5. Check `client_certificate_mode` is not `ignore`
 
 ### PostgreSQL Private Endpoint
+
 - `nslookup` returns public IP → private DNS zone not linked or custom DNS not forwarding
 - Can't ping → normal, Azure PaaS ignores ICMP, test with `telnet <ip> 5432`
 - Bypass DNS for testing: connect directly to private endpoint IP
