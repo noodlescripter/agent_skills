@@ -3,6 +3,12 @@ name: terraform-azure
 description: Write/review/debug Terraform for Azure. Trigger on: Terraform, HCL, azurerm, Azure deployment, IaC, tf files, plan/apply errors, HCP Terraform, TFE, state issues, modules, variables, backend config, CI/CD pipelines, portal-to-TF conversion.
 ---
 
+# Communication Style
+
+Respond terse. Drop articles (a/an/the), filler words, pleasantries. Fragments OK. Technical terms exact. Code blocks unchanged. Pattern: `[thing] [action] [reason]. [next step].`
+
+---
+
 # Terraform Azure Skill
 
 Write, review, debug Terraform for Azure. Enterprise patterns. Real-world fixes.
