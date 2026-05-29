@@ -1,6 +1,6 @@
-# AGENT.md — CCP Dev Infrastructure (App Gateway / DNS Resolver / Key Vault)
+# AGENT.md — Dev Infrastructure (App Gateway / DNS Resolver / Key Vault)
 
-Context and operational notes for the Client Connect Portal (CCP) dev environment on Azure.
+Context and operational notes for a dev environment on Azure.
 Terraform-managed via HCP Terraform (TFE). Files live under `tf/dev/` with named prefixes.
 
 ---
@@ -11,13 +11,13 @@ Terraform-managed via HCP Terraform (TFE). Files live under `tf/dev/` with named
 Internet/Internal client
         │
         ▼
-App Gateway (ext vnet)            vnet_clientconnectportal_azure_eus2_ext
-  private frontend IP: 10.7.223.36
+App Gateway (ext vnet)            vnet_myproject_eus2_ext
+  private frontend IP: 10.0.1.10
         │  VNet peering (Connected, forwarded traffic allowed)
         ▼
-Container Apps env (dev vnet)     vnet_clientconnectportal_azure_eus2_dev
-  internal load balancer IP: 10.34.47.47
-  app: ccp-ui-dev
+Container Apps env (dev vnet)     vnet_myproject_eus2_dev
+  internal load balancer IP: 10.0.2.20
+  app: myapp-dev
 ```
 
 - ACA environment is **internal** (`internal_load_balancer_enabled = true`).
@@ -32,7 +32,7 @@ Resource: `azurerm_application_gateway.application_gateway_dev` (`application_ga
 File: `tf/dev/network_appgateway_private_ui.tf`
 
 - SKU: `Standard_v2`, capacity 1.
-- Two frontends: public IP frontend and a **private** frontend (`10.7.223.36`, Static).
+- Two frontends: public IP frontend and a **private** frontend (`10.0.1.10`, Static).
 - Private listener (`appgw-http-listener-private`) on `http-private-port` (80) is the active path.
 - Public listener / public routing rule are commented out — private only is in use.
 
@@ -40,13 +40,13 @@ File: `tf/dev/network_appgateway_private_ui.tf`
 ```hcl
 backend_address_pool {
   name  = "appgw-backend-pool"
-  fqdns = ["ccp-ui-dev.calmwater-77d9cb43.eastus2.azurecontainerapps.io"]
+  fqdns = ["myapp-dev.myenv-abcd1234.eastus2.azurecontainerapps.io"]
 }
 ```
 
 > **FQDN — no `.internal.` subdomain.** The private DNS zone is
-> `calmwater-77d9cb43.eastus2.azurecontainerapps.io` with a wildcard `*` A record
-> → `10.34.47.47`. The ACA Application URL for this environment does NOT contain
+> `myenv-abcd1234.eastus2.azurecontainerapps.io` with a wildcard `*` A record
+> → `10.0.2.20`. The ACA Application URL for this environment does NOT contain
 > `.internal.`, so the backend FQDN must match the wildcard zone exactly. Adding
 > `.internal.` produces `Local Error: DNSResolution` on the App Gateway hop in
 > Connection Troubleshoot.
@@ -79,12 +79,12 @@ probe {
 }
 ```
 
-> Probe `host` and backend `host_name` previously pointed to a `local.react_ui_fqdn`
+> Probe `host` and backend `host_name` previously pointed to a `local.app_fqdn`
 > that resolved incorrectly. That local was removed and replaced with the actual
 > wildcard FQDN. Keep host header consistent across probe + backend settings.
 
 ### SSL profile
-- `ssl_profile` `ccp-appgw-ssl-profile`, policy `CustomV2`, min TLS `TLSv1_2`.
+- `ssl_profile` `app-appgw-ssl-profile`, policy `CustomV2`, min TLS `TLSv1_2`.
 - Cipher suites restricted to ECDHE AES 128/256 GCM (RSA + ECDSA).
 
 ---
@@ -93,21 +93,21 @@ probe {
 
 The VNets do **not** use Azure-provided DNS. Custom DNS is configured on the VNet
 (two internal DNS server IPs). Custom DNS servers do not natively know Azure Private
-DNS zones, so `*.calmwater-77d9cb43.eastus2.azurecontainerapps.io` returns NXDOMAIN
+DNS zones, so `*.myenv-abcd1234.eastus2.azurecontainerapps.io` returns NXDOMAIN
 unless explicitly forwarded.
 
 ### Confirmed working
-- Private DNS zone `calmwater-77d9cb43.eastus2.azurecontainerapps.io` exists.
+- Private DNS zone `myenv-abcd1234.eastus2.azurecontainerapps.io` exists.
 - Zone is **linked to both** vnets:
   - `aca-env-dns-zone-appgw-link` → ext vnet
   - `aca-env-dns-zone-dev-link` → dev vnet
-- Record sets: `*  A  10.34.47.47` (wildcard) and `@  SOA`. The SOA `@` has no A record — that is normal.
+- Record sets: `*  A  10.0.2.20` (wildcard) and `@  SOA`. The SOA `@` has no A record — that is normal.
 
 ### The fix
 Add a **conditional forwarder** on the custom DNS servers (both IPs) for the zone:
 
 ```
-Zone:        calmwater-77d9cb43.eastus2.azurecontainerapps.io   (NO .internal.)
+Zone:        myenv-abcd1234.eastus2.azurecontainerapps.io   (NO .internal.)
 Forward to:  <target depends on where custom DNS lives>
 ```
 
@@ -126,8 +126,8 @@ File: `tf/dev/network_dns_resolver.tf`
 - The inbound endpoint private IP is the forwarder target for the custom DNS.
 - Verify after the forwarder is added:
   ```bash
-  nslookup ccp-ui-dev.calmwater-77d9cb43.eastus2.azurecontainerapps.io <inbound-endpoint-ip>
-  # expect 10.34.47.47
+  nslookup myapp-dev.myenv-abcd1234.eastus2.azurecontainerapps.io <inbound-endpoint-ip>
+  # expect 10.0.2.20
   ```
 
 ---
@@ -153,12 +153,12 @@ Work top-down; each was checked for this environment:
 
 1. **Peering** — Connected + forwarded traffic on. ✅
 2. **Private DNS zone links** — linked to both vnets. ✅
-3. **Wildcard A record** — `* → 10.34.47.47` present. ✅
+3. **Wildcard A record** — `* → 10.0.2.20` present. ✅
 4. **Backend FQDN** — must equal the wildcard zone name, **no `.internal.`**. ✅ (was the first bug)
 5. **Custom DNS forwarder** — required because VNet uses custom DNS, not Azure DNS. ← network team action
 6. **Connection Troubleshoot** — `application_gateway_dev01` hop showing
    `Local Error: DNSResolution` = forwarder/FQDN issue. Destination `Healthy` =
-   the IP `10.34.47.47` is reachable, so peering/routing are fine.
+   the IP `10.0.2.20` is reachable, so peering/routing are fine.
 7. **Container port** — once DNS resolves, a crashing container with the wrong
    `ingress.target_port` looks like a backend failure. App listens on **3000**, so
    `ingress { target_port = 3000 }` (was previously 8080 → crash on port mismatch). ✅ (was the second bug)
